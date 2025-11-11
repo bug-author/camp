@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"net/http"
 
 	"github.com/codersgyan/camp/internal/contact"
 	"github.com/codersgyan/camp/internal/database"
@@ -21,17 +21,9 @@ func main() {
 	}
 
 	contactRepository := contact.NewRepository(db)
+	contactHandler := contact.NewHandler(contactRepository)
 
-	newContact := contact.Contact{
-		FirstName: "Rakesh",
-		LastName:  "K",
-		Email:     "rakesh@codersgyan.com",
-	}
+	http.HandleFunc("POST /api/contacts", contactHandler.Create)
 
-	createdId, err := contactRepository.Create(&newContact)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("created id: %d", createdId)
+	http.ListenAndServe(":8080", nil)
 }
