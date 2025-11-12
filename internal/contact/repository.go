@@ -17,6 +17,7 @@ func NewRepository(db *sql.DB) *Repository {
 }
 
 func (r *Repository) CreateContactOrUpsertTags(c *Contact) (int64, error) {
+	// check if email already exists
 	existingContact, err := r.GetByEmail(c.Email)
 	if err != nil {
 		return 0, err
@@ -34,161 +35,60 @@ func (r *Repository) CreateContactOrUpsertTags(c *Contact) (int64, error) {
 		}
 		defer txn.Rollback()
 
-		// get tags
-		for _, tag := range c.Tags {
-			_, err := txn.Exec(`INSERT OR IGNORE INTO tags (text) VALUES (?)`, tag.Text)
-			if err != nil {
-				return 0, fmt.Errorf("failed to insert tag: %w", err)
-			}
-		}
-
-		placeholders := make([]string, len(c.Tags))
-		args := make([]interface{}, len(c.Tags))
-
-		for i, tag := range c.Tags {
-			placeholders[i] = "?"
-			args[i] = tag.Text
-		}
-
-		query := fmt.Sprintf(`
-			SELECT id, text
-			FROM tags
-			WHERE text IN (%s)`, strings.Join(placeholders, ","))
-
-		rows, err := txn.Query(query, args...)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return 0, nil
-			}
-			return 0, fmt.Errorf("failed to select tags: %w", err)
-		}
-
-		defer rows.Close()
-
-		var tags []Tag
-		for rows.Next() {
-			var tag Tag
-			if err := rows.Scan(&tag.ID, &tag.Text); err != nil {
-				return 0, fmt.Errorf("failed to scan tag: %w", err)
-			}
-			tags = append(tags, tag)
-		}
-
-		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("failed to scan rows while selecting tags: %w", err)
-		}
-
-		// add pivot table records
-		valueStrings := make([]string, 0, len(tags))
-		valueArgs := make([]interface{}, 0, len(tags)*2)
-
-		for _, tag := range tags {
-			valueStrings = append(valueStrings, "(?, ?)")
-			valueArgs = append(valueArgs, existingContact.ID, tag.ID)
-		}
-
-		pivotQuery := fmt.Sprintf(`
-    	INSERT OR IGNORE INTO contact_tag (contact_id, tag_id)
-    	VALUES %s`, strings.Join(valueStrings, ","))
-
-		_, err = txn.Exec(pivotQuery, valueArgs...)
-		if err != nil {
-			return 0, fmt.Errorf("failed to add record in pivot table: %w", err)
-		}
-
-		err = txn.Commit()
+		err = insertTagIfNotExist(txn, c.Tags)
 		if err != nil {
 			return 0, err
 		}
 
-		// todo: think what to return 0 is problematic, since we have created tags but zero was for created contact.
-		return 0, nil
+		// get tags
+		tags, err := getTagsByTexts(txn, c.Tags)
+		if err != nil {
+			return 0, err
+		}
+
+		// add pivot table records
+		if err := linkTagsToContact(txn, existingContact.ID, tags); err != nil {
+			return 0, err
+		}
+
+		if err := txn.Commit(); err != nil {
+			return 0, err
+		}
+
+		return existingContact.ID, nil
 	}
 
-	// if we reach here means we are creating contact newly.
-	query := `
-		INSERT INTO contacts (fname, lname, email, phone)
-		VALUES(?, ?, ?, ?)
-	`
+	// create contact
+
 	txn, err := r.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer txn.Rollback()
 
-	createdContact, err := txn.Exec(query, c.FirstName, c.LastName, c.Email, c.Phone)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create a contact: %w", err)
-	}
-	lastId, err := createdContact.LastInsertId()
+	lastId, err := createContact(txn, c)
 	if err != nil {
 		return 0, err
 	}
 
 	// if tags exists create tags
 	if len(c.Tags) > 0 {
-		// get tags
-		for _, tag := range c.Tags {
-			_, err := txn.Exec(`INSERT OR IGNORE INTO tags (text) VALUES (?)`, tag.Text)
-			if err != nil {
-				return 0, fmt.Errorf("failed to insert tag: %w", err)
-			}
-		}
-
-		placeholders := make([]string, len(c.Tags))
-		args := make([]interface{}, len(c.Tags))
-
-		for i, tag := range c.Tags {
-			placeholders[i] = "?"
-			args[i] = tag.Text
-		}
-
-		query := fmt.Sprintf(`
-			SELECT id, text
-			FROM tags
-			WHERE text IN (%s)`, strings.Join(placeholders, ","))
-
-		rows, err := txn.Query(query, args...)
+		err = insertTagIfNotExist(txn, c.Tags)
 		if err != nil {
 			return 0, err
 		}
 
-		defer rows.Close()
-
-		var tags []Tag
-		for rows.Next() {
-			var tag Tag
-			if err := rows.Scan(&tag.ID, &tag.Text); err != nil {
-				return 0, err
-			}
-			tags = append(tags, tag)
-		}
-
-		if err := rows.Err(); err != nil {
+		tags, err := getTagsByTexts(txn, c.Tags)
+		if err != nil {
 			return 0, err
 		}
 
-		// add pivot table records
-		valueStrings := make([]string, 0, len(tags))
-		valueArgs := make([]interface{}, 0, len(tags)*2)
-
-		for _, tag := range tags {
-			valueStrings = append(valueStrings, "(?, ?)")
-			valueArgs = append(valueArgs, lastId, tag.ID)
-		}
-
-		pivotQuery := fmt.Sprintf(`
-    	INSERT OR IGNORE INTO contact_tag (contact_id, tag_id)
-    	VALUES %s`, strings.Join(valueStrings, ","))
-
-		_, err = txn.Exec(pivotQuery, valueArgs...)
-		if err != nil {
-			return 0, fmt.Errorf("failed to create record in contaCt tag pivot table: %w", err)
+		if err := linkTagsToContact(txn, lastId, tags); err != nil {
+			return 0, err
 		}
 	}
 
-	err = txn.Commit()
-	if err != nil {
+	if err := txn.Commit(); err != nil {
 		return 0, err
 	}
 
@@ -229,4 +129,94 @@ func (r *Repository) GetByEmail(email string) (Contact, error) {
 	}
 
 	return result, nil
+}
+
+func insertTagIfNotExist(txn *sql.Tx, tags []Tag) error {
+	// todo: do this in a single query.
+	for _, tag := range tags {
+		_, err := txn.Exec(`INSERT OR IGNORE INTO tags (text) VALUES (?)`, tag.Text)
+		if err != nil {
+			return fmt.Errorf("failed to insert tag: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func getTagsByTexts(txn *sql.Tx, tags []Tag) ([]Tag, error) {
+
+	placeholders := make([]string, len(tags))
+	args := make([]interface{}, len(tags))
+
+	for i, tag := range tags {
+		placeholders[i] = "?"
+		args[i] = tag.Text
+	}
+
+	query := fmt.Sprintf(`
+			SELECT id, text
+			FROM tags
+			WHERE text IN (%s)`, strings.Join(placeholders, ","))
+
+	rows, err := txn.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select tags: %w", err)
+	}
+
+	defer rows.Close()
+
+	var resultTags []Tag
+	for rows.Next() {
+		var tag Tag
+		if err := rows.Scan(&tag.ID, &tag.Text); err != nil {
+			return nil, fmt.Errorf("failed to scan tag: %w", err)
+		}
+		resultTags = append(resultTags, tag)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to scan rows while selecting tags: %w", err)
+	}
+
+	return resultTags, nil
+}
+
+func linkTagsToContact(txn *sql.Tx, contactID int64, tags []Tag) error {
+
+	valueStrings := make([]string, 0, len(tags))
+	valueArgs := make([]interface{}, 0, len(tags)*2)
+
+	for _, tag := range tags {
+		valueStrings = append(valueStrings, "(?, ?)")
+		valueArgs = append(valueArgs, contactID, tag.ID)
+	}
+
+	query := fmt.Sprintf(`
+    	INSERT OR IGNORE INTO contact_tag (contact_id, tag_id)
+    	VALUES %s`, strings.Join(valueStrings, ","))
+
+	_, err := txn.Exec(query, valueArgs...)
+	if err != nil {
+		return fmt.Errorf("failed to add record in pivot table: %w", err)
+	}
+
+	return nil
+}
+
+func createContact(txn *sql.Tx, c *Contact) (int64, error) {
+	query := `
+		INSERT INTO contacts (fname, lname, email, phone)
+		VALUES(?, ?, ?, ?)
+	`
+
+	result, err := txn.Exec(query, c.FirstName, c.LastName, c.Email, c.Phone)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create a contact: %w", err)
+	}
+	lastId, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	return lastId, nil
 }

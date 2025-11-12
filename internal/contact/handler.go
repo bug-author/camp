@@ -16,6 +16,7 @@ func NewHandler(repo *Repository) *Handler {
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
+	// todo: request validation
 	var contactBody Contact
 
 	if err := json.NewDecoder(r.Body).Decode(&contactBody); err != nil {
